@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>postgres-testapp</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, monospace; }
+    body { max-width: 72rem; margin: 2rem auto; padding: 0 1rem; background: #111; color: #ddd; }
+    h1 { color: #fff; }
+    .state, form { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+    .ok { color: #77dd77; } .marker { color: #ffd166; } .error { color: #ff6b6b; }
+    button, input { font: inherit; padding: .5rem; }
+    input { min-width: 20rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: .35rem .5rem; border-bottom: 1px solid #333; text-align: left; white-space: nowrap; }
+    td:last-child { width: 100%; white-space: normal; }
+    #restore { padding: .75rem; border: 1px solid #ffd166; display: none; }
+  </style>
+</head>
+<body>
+  <h1>postgres-testapp <span id="live" class="error">connecting</span></h1>
+  <div id="state" class="state"></div>
+  <form id="marker-form">
+    <input id="message" required maxlength="200" placeholder="PITR marker name">
+    <button>Create restore point</button>
+  </form>
+  <div id="restore"></div>
+  <form id="wipe-form">
+    <button>Wipe all events</button>
+    <span>This is intentionally destructive.</span>
+  </form>
+  <table>
+    <thead><tr><th>ID</th><th>Database time</th><th>Instance</th><th>Kind</th><th>Message</th></tr></thead>
+    <tbody id="events"></tbody>
+  </table>
+<script>
+const rows = document.querySelector('#events');
+const live = document.querySelector('#live');
+const state = document.querySelector('#state');
+const restore = document.querySelector('#restore');
+
+async function refreshState() {
+  const response = await fetch('/api/state');
+  if (!response.ok) throw new Error(await response.text());
+  const s = await response.json();
+  state.textContent = `db=${s.database} user=${s.user} rows=${s.event_count} db-time=${s.database_time}`;
+}
+
+function addEvent(event) {
+  const tr = document.createElement('tr');
+  if (event.kind === 'marker') tr.className = 'marker';
+  for (const value of [event.id, event.created_at, event.instance, event.kind, event.message]) {
+    const td = document.createElement('td');
+    td.textContent = value;
+    tr.appendChild(td);
+  }
+  rows.prepend(tr);
+  while (rows.children.length > 200) rows.lastElementChild.remove();
+}
+
+const stream = new EventSource('/api/events');
+stream.onopen = () => { live.textContent = 'live'; live.className = 'ok'; };
+stream.onerror = () => { live.textContent = 'reconnecting'; live.className = 'error'; };
+stream.onmessage = e => { addEvent(JSON.parse(e.data)); refreshState().catch(console.error); };
+
+document.querySelector('#marker-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const message = document.querySelector('#message').value;
+  const response = await fetch('/api/markers', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({message})});
+  if (!response.ok) return alert(await response.text());
+  const result = await response.json();
+  restore.style.display = 'block';
+  restore.textContent = `Restore target: ${result.restore_target} — marker #${result.marker.id} ${result.marker.message}`;
+});
+
+document.querySelector('#wipe-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (!confirm('Delete every event? Keep the restore target first.')) return;
+  const response = await fetch('/api/wipe', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({confirm: 'wipe'})});
+  if (!response.ok) return alert(await response.text());
+  rows.replaceChildren();
+  await refreshState();
+});
+
+refreshState().catch(console.error);
+</script>
+</body>
+</html>
