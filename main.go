@@ -86,6 +86,9 @@ func run() error {
 	mux.HandleFunc("GET /api/state", s.state)
 	mux.HandleFunc("GET /api/events", s.events)
 	mux.HandleFunc("POST /api/markers", s.marker)
+	mux.HandleFunc("POST /api/start", s.start)
+	mux.HandleFunc("POST /api/stop", s.stop)
+	mux.HandleFunc("POST /api/sql", s.sql)
 	mux.HandleFunc("POST /api/wipe", s.wipe)
 
 	httpServer := &http.Server{
@@ -143,7 +146,10 @@ func migrate(ctx context.Context) error {
 	migrations := []struct {
 		version int
 		path    string
-	}{{version: 1, path: "migrations/001_init.sql"}}
+	}{
+		{version: 1, path: "migrations/001_init.sql"},
+		{version: 2, path: "migrations/002_activity_control.sql"},
+	}
 	for _, migration := range migrations {
 		var applied bool
 		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", migration.version).Scan(&applied); err != nil {
@@ -208,16 +214,27 @@ func (s *server) writeHeartbeats(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		var running bool
+		if err := s.db.QueryRow(ctx, "SELECT running FROM app_control WHERE singleton").Scan(&running); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				s.log.Error("read activity state", "err", err)
+			}
+			continue
+		}
+		if !running {
+			continue
+		}
 		if _, err := s.db.Exec(ctx,
 			"INSERT INTO events (instance, kind, message) VALUES ($1, 'heartbeat', 'alive')",
 			s.instance,
 		); err != nil && !errors.Is(err, context.Canceled) {
 			s.log.Error("write heartbeat", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -243,11 +260,13 @@ func (s *server) state(w http.ResponseWriter, r *http.Request) {
 		Count    int64     `json:"event_count"`
 		FirstID  *int64    `json:"first_id"`
 		LastID   *int64    `json:"last_id"`
+		Running  bool      `json:"running"`
 	}
 	if err := s.db.QueryRow(r.Context(), `
-		SELECT current_database(), current_user, clock_timestamp(), count(*), min(id), max(id)
+		SELECT current_database(), current_user, clock_timestamp(), count(*), min(id), max(id),
+		       (SELECT running FROM app_control WHERE singleton)
 		FROM events
-	`).Scan(&state.Database, &state.User, &state.Now, &state.Count, &state.FirstID, &state.LastID); err != nil {
+	`).Scan(&state.Database, &state.User, &state.Now, &state.Count, &state.FirstID, &state.LastID, &state.Running); err != nil {
 		http.Error(w, "query database state", http.StatusInternalServerError)
 		return
 	}
@@ -368,6 +387,105 @@ func (s *server) marker(w http.ResponseWriter, r *http.Request) {
 	}{Marker: marker, RestoreTarget: restoreTarget})
 }
 
+func (s *server) start(w http.ResponseWriter, r *http.Request) {
+	s.setRunning(w, r, true)
+}
+
+func (s *server) stop(w http.ResponseWriter, r *http.Request) {
+	s.setRunning(w, r, false)
+}
+
+func (s *server) setRunning(w http.ResponseWriter, r *http.Request, running bool) {
+	command, err := s.db.Exec(r.Context(), "UPDATE app_control SET running = $1 WHERE singleton", running)
+	if err != nil {
+		http.Error(w, "update activity state", http.StatusInternalServerError)
+		return
+	}
+	if command.RowsAffected() != 1 {
+		http.Error(w, "activity state is missing", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Running bool `json:"running"`
+	}{Running: running})
+}
+
+func (s *server) sql(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		SQL string `json:"sql"`
+	}
+	if err := decodeJSON(r.Body, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, struct {
+			Error string `json:"error"`
+		}{Error: err.Error()})
+		return
+	}
+	input.SQL = strings.TrimSpace(input.SQL)
+	if input.SQL == "" || len(input.SQL) > 4000 {
+		writeJSON(w, http.StatusBadRequest, struct {
+			Error string `json:"error"`
+		}{Error: "sql must contain 1-4000 characters"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	rows, err := s.db.Query(ctx, input.SQL)
+	if err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, struct {
+			Error string `json:"error"`
+		}{Error: err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	fields := rows.FieldDescriptions()
+	columns := make([]string, len(fields))
+	for i, field := range fields {
+		columns[i] = field.Name
+	}
+	resultRows := make([][]any, 0, 16)
+	truncated := false
+	for rows.Next() {
+		if len(resultRows) == 100 {
+			truncated = true
+			break
+		}
+		values, err := rows.Values()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, struct {
+				Error string `json:"error"`
+			}{Error: "read query result"})
+			return
+		}
+		result := make([]any, len(values))
+		for i, value := range values {
+			if value != nil {
+				result[i] = fmt.Sprint(value)
+			}
+		}
+		resultRows = append(resultRows, result)
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, struct {
+			Error string `json:"error"`
+		}{Error: err.Error()})
+		return
+	}
+	rows.Close()
+	writeJSON(w, http.StatusOK, struct {
+		Columns   []string `json:"columns"`
+		Rows      [][]any  `json:"rows"`
+		Command   string   `json:"command"`
+		Truncated bool     `json:"truncated"`
+	}{
+		Columns:   columns,
+		Rows:      resultRows,
+		Command:   rows.CommandTag().String(),
+		Truncated: truncated,
+	})
+}
+
 func (s *server) wipe(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Confirm string `json:"confirm"`
@@ -400,7 +518,7 @@ func (s *server) wipe(w http.ResponseWriter, r *http.Request) {
 
 func decodeJSON(body io.ReadCloser, target any) error {
 	defer body.Close()
-	decoder := json.NewDecoder(io.LimitReader(body, 4096))
+	decoder := json.NewDecoder(io.LimitReader(body, 16*1024))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)

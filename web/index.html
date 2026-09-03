@@ -7,44 +7,91 @@
   <style>
     :root { color-scheme: dark; font-family: ui-monospace, monospace; }
     body { max-width: 72rem; margin: 2rem auto; padding: 0 1rem; background: #111; color: #ddd; }
-    h1 { color: #fff; }
-    .state, form { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
-    .ok { color: #77dd77; } .marker { color: #ffd166; } .error { color: #ff6b6b; }
-    button, input { font: inherit; padding: .5rem; }
+    h1, h2 { color: #fff; }
+    section { margin: 2rem 0; }
+    .state, form, .controls { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+    .ok { color: #77dd77; } .marker { color: #ffd166; } .error { color: #ff6b6b; } .stopped { color: #aaa; }
+    button, input, textarea { font: inherit; padding: .5rem; }
+    button { cursor: pointer; }
+    button:disabled { cursor: default; opacity: .45; }
     input { min-width: 20rem; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 8rem; resize: vertical; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: .35rem .5rem; border-bottom: 1px solid #333; text-align: left; white-space: nowrap; }
     td:last-child { width: 100%; white-space: normal; }
     #restore { padding: .75rem; border: 1px solid #ffd166; display: none; }
+    #sql-result { padding: .75rem; border: 1px solid #444; overflow-x: auto; white-space: pre-wrap; }
   </style>
 </head>
 <body>
   <h1>postgres-testapp <span id="live" class="error">connecting</span></h1>
   <div id="state" class="state"></div>
-  <form id="marker-form">
-    <input id="message" required maxlength="200" placeholder="PITR marker name">
-    <button>Create restore point</button>
-  </form>
-  <div id="restore"></div>
-  <form id="wipe-form">
-    <button>Wipe all events</button>
-    <span>This is intentionally destructive.</span>
-  </form>
-  <table>
-    <thead><tr><th>ID</th><th>Database time</th><th>Instance</th><th>Kind</th><th>Message</th></tr></thead>
-    <tbody id="events"></tbody>
-  </table>
+
+  <section>
+    <h2>Activity</h2>
+    <div class="controls">
+      <strong id="activity" class="stopped">stopped</strong>
+      <button id="start" type="button">Start heartbeats</button>
+      <button id="stop" type="button">Stop heartbeats</button>
+    </div>
+    <form id="marker-form">
+      <input id="message" required maxlength="200" placeholder="PITR marker name">
+      <button>Create restore point</button>
+    </form>
+    <div id="restore"></div>
+    <form id="wipe-form">
+      <button>Wipe all events</button>
+      <span>This is intentionally destructive.</span>
+    </form>
+  </section>
+
+  <section>
+    <h2>SQL as runtime readwrite user</h2>
+    <p>Run one statement with a 10 second timeout. Use this to verify allowed and denied operations.</p>
+    <form id="sql-form">
+      <textarea id="sql" required maxlength="4000" spellcheck="false">SELECT current_user, current_database(), clock_timestamp();</textarea>
+      <button>Run SQL</button>
+    </form>
+    <pre id="sql-result">No query run yet.</pre>
+  </section>
+
+  <section>
+    <h2>Events</h2>
+    <table>
+      <thead><tr><th>ID</th><th>Database time</th><th>Instance</th><th>Kind</th><th>Message</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table>
+  </section>
 <script>
 const rows = document.querySelector('#events');
 const live = document.querySelector('#live');
 const state = document.querySelector('#state');
+const activity = document.querySelector('#activity');
+const startButton = document.querySelector('#start');
+const stopButton = document.querySelector('#stop');
 const restore = document.querySelector('#restore');
+const sqlResult = document.querySelector('#sql-result');
+
+function showRunning(running) {
+  activity.textContent = running ? 'running' : 'stopped';
+  activity.className = running ? 'ok' : 'stopped';
+  startButton.disabled = running;
+  stopButton.disabled = !running;
+}
 
 async function refreshState() {
   const response = await fetch('/api/state');
   if (!response.ok) throw new Error(await response.text());
   const s = await response.json();
   state.textContent = `db=${s.database} user=${s.user} rows=${s.event_count} db-time=${s.database_time}`;
+  showRunning(s.running);
+}
+
+async function setRunning(action) {
+  const response = await fetch(`/api/${action}`, {method: 'POST'});
+  if (!response.ok) return alert(await response.text());
+  const result = await response.json();
+  showRunning(result.running);
 }
 
 function addEvent(event) {
@@ -64,6 +111,9 @@ stream.onopen = () => { live.textContent = 'live'; live.className = 'ok'; };
 stream.onerror = () => { live.textContent = 'reconnecting'; live.className = 'error'; };
 stream.onmessage = e => { addEvent(JSON.parse(e.data)); refreshState().catch(console.error); };
 
+startButton.addEventListener('click', () => setRunning('start'));
+stopButton.addEventListener('click', () => setRunning('stop'));
+
 document.querySelector('#marker-form').addEventListener('submit', async e => {
   e.preventDefault();
   const message = document.querySelector('#message').value;
@@ -80,6 +130,25 @@ document.querySelector('#wipe-form').addEventListener('submit', async e => {
   const response = await fetch('/api/wipe', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({confirm: 'wipe'})});
   if (!response.ok) return alert(await response.text());
   rows.replaceChildren();
+  await refreshState();
+});
+
+document.querySelector('#sql-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  sqlResult.className = '';
+  sqlResult.textContent = 'Running…';
+  const response = await fetch('/api/sql', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({sql: document.querySelector('#sql').value}),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    sqlResult.className = 'error';
+    sqlResult.textContent = result.error || JSON.stringify(result, null, 2);
+    return;
+  }
+  sqlResult.textContent = JSON.stringify(result, null, 2);
   await refreshState();
 });
 
